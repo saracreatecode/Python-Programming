@@ -147,7 +147,7 @@ def limpiar_anio(valor):
     """Valida que el año sea un número de 4 dígitos razonable."""
     texto = limpiar_texto(str(valor)) if not pd.isna(valor) else ""
     if not texto or texto == "nan":
-        return "", None, None
+        return None, None, None  # None en lugar de "" para columnas numéricas
     try:
         anio = int(float(texto))
         if 1950 <= anio <= datetime.now().year:
@@ -337,7 +337,8 @@ def procesar_excel():
             # Web
             df.at[idx, "web"] = limpiar_web(fila.get("web", ""))
 
-            # Año
+            # Año — convertir columna a object para admitir strings y None
+            df["año_ultimo_trabajo"] = df["año_ultimo_trabajo"].astype(object)
             anio_limpio, anio_valido, anio_msg = limpiar_anio(fila.get("año_ultimo_trabajo", ""))
             df.at[idx, "año_ultimo_trabajo"] = anio_limpio
             if anio_valido is False:
