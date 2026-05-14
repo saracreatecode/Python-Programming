@@ -34,8 +34,8 @@ from datetime import datetime
 # CONFIGURACIÓN — ajusta estas rutas
 # ─────────────────────────────────────────────
 
-RUTA_EXCEL_LIMPIO = r"\\SERVIDOR\Compartido\contactos_limpio.xlsx"
-RUTA_LOG          = r"\\SERVIDOR\Compartido\logs\sincronizacion_log.txt"
+RUTA_EXCEL_LIMPIO = r"\\SERVIDOR\ruta\al\excel\limpio.xlsx"  # Ruta al Excel limpio generado por el paso 1
+RUTA_LOG          = r"\\SERVIDOR\ruta\al\log\sincronizacion_log.txt"  # Dónde guardar el log de la sincronización
 
 # Nombre de la carpeta raíz en Outlook donde se crearán las subcarpetas
 CARPETA_RAIZ_OUTLOOK = "Contactos Empresa"

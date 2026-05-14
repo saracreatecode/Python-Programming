@@ -29,9 +29,9 @@ from datetime import datetime
 # CONFIGURACIÓN — ajusta estas rutas
 # ─────────────────────────────────────────────
 
-RUTA_EXCEL_ORIGINAL = r"\\SERVIDOR\Compartido\contactos.xlsx"   # Ruta al Excel en el servidor
-RUTA_EXCEL_LIMPIO   = r"\\SERVIDOR\Compartido\contactos_limpio.xlsx"  # Dónde guardar el resultado
-RUTA_LOG            = r"\\SERVIDOR\Compartido\logs\limpieza_log.txt"  # Log de errores/avisos
+RUTA_EXCEL_ORIGINAL = r"\\servidor\ruta\al\excel\original.xlsx"   # Ruta al Excel en el servidor
+RUTA_EXCEL_LIMPIO   = r"\\servidor\ruta\al\excel\limpio.xlsx"  # Dónde guardar el resultado
+RUTA_LOG            = r"\\servidor\ruta\al\log\limpieza_log.txt"  # Log de errores/avisos
 
 # Hojas a procesar (G se excluye intencionadamente)
 HOJAS = {
@@ -54,7 +54,10 @@ MAPEO_COLUMNAS = {
     "TIPO":                 "tipo",
     "ÁREA":                 "area",
     "CARGO":                "cargo",
-    "MAIL":                 "email",
+    "MAIL":                 "MAIL1",
+    "MAIL1":                "MAIL1",
+    "MAIL2":                "MAIL2",
+    "MAIL3":                "MAIL3",
     "AÑO ÚLTIMO TRABAJO":   "año_ultimo_trabajo",
     "NOTA":                 "nota",
     "DIRECCIÓN":            "direccion",
@@ -72,11 +75,29 @@ MAPEO_COLUMNAS = {
 # FUNCIONES DE LIMPIEZA
 # ─────────────────────────────────────────────
 
+# Caracteres invisibles Unicode que pueden colarse al copiar/pegar
+CHARS_INVISIBLES = [
+    '\u200e',  # Left-to-Right Mark (LRM)
+    '\u200f',  # Right-to-Left Mark (RLM)
+    '\u200b',  # Zero Width Space
+    '\u200c',  # Zero Width Non-Joiner
+    '\u200d',  # Zero Width Joiner
+    '\u00ad',  # Soft Hyphen
+    '\ufeff',  # BOM / Zero Width No-Break Space
+    '\u202a',  # Left-to-Right Embedding
+    '\u202b',  # Right-to-Left Embedding
+    '\u202c',  # Pop Directional Formatting
+]
+
 def limpiar_texto(valor):
-    """Elimina espacios extra, normaliza mayúsculas/minúsculas."""
+    """Elimina espacios extra, caracteres invisibles Unicode y normaliza."""
     if pd.isna(valor) or str(valor).strip() == "":
         return ""
     texto = str(valor).strip()
+    # Eliminar caracteres invisibles
+    for char in CHARS_INVISIBLES:
+        texto = texto.replace(char, "")
+    texto = texto.strip()
     # Elimina múltiples espacios internos
     texto = re.sub(r'\s+', ' ', texto)
     return texto
@@ -98,15 +119,31 @@ def limpiar_nombre_propio(valor):
     return " ".join(resultado)
 
 def limpiar_email(valor):
-    """Valida y normaliza email. Devuelve (email_limpio, es_valido, mensaje_error)."""
-    texto = limpiar_texto(valor).lower()
+    """
+    Valida y normaliza email. Devuelve (email_limpio, es_valido, mensaje_error).
+    Soporta:
+    - Guiones en parte local y dominio: nombre-apellido@empresa-web.com
+    - Caracteres internacionales en parte local: ß, ü, ñ, etc. (RFC 6531)
+    - Dominios con guión: my-company.com
+    """
+    texto = limpiar_texto(valor).strip()
     if not texto:
         return "", None, None  # Vacío es aceptable
-    patron = r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
-    if re.match(patron, texto):
-        return texto, True, None
+
+    # Normalizar: lowercase solo en el dominio, respetar parte local
+    if "@" in texto:
+        parte_local, dominio = texto.rsplit("@", 1)
+        texto_normalizado = parte_local + "@" + dominio.lower()
     else:
-        return texto, False, f"Email con formato inválido: '{texto}'"
+        texto_normalizado = texto
+
+    # Patrón extendido con soporte unicode (ß, ñ, ü...) y guiones
+    patron = r'^[\w.%+\-]+@[a-zA-Z0-9\-]+(\.[a-zA-Z0-9\-]+)*\.[a-zA-Z]{2,}$'
+
+    if re.match(patron, texto_normalizado, re.UNICODE):
+        return texto_normalizado, True, None
+    else:
+        return texto_normalizado, False, f"Email con formato inválido: '{texto_normalizado}'"
 
 def limpiar_telefono(valor):
     """
@@ -128,8 +165,14 @@ def limpiar_telefono(valor):
     # Reconstruye con + si lo tenía
     limpio = ("+" if tiene_mas else "") + solo_digitos
 
-    # Validación básica de longitud (7-15 dígitos según ITU-T E.164)
-    if len(solo_digitos) < 7 or len(solo_digitos) > 15:
+    # Números cortos de servicios públicos españoles (010, 011, 012, 016, 060, 112...)
+    # son válidos aunque tengan menos de 7 dígitos
+    NUMEROS_CORTOS_VALIDOS = {"010", "011", "012", "016", "017", "060", "061", "062", "112", "016"}
+    if solo_digitos in NUMEROS_CORTOS_VALIDOS:
+        return limpio, True, None
+
+    # Validación de longitud: mínimo 3 dígitos (otros servicios cortos), máximo 15 (ITU-T E.164)
+    if len(solo_digitos) < 3 or len(solo_digitos) > 15:
         return limpio, False, f"Teléfono con longitud inusual ({len(solo_digitos)} dígitos): '{limpio}'"
 
     return limpio, True, None
@@ -164,53 +207,58 @@ def limpiar_anio(valor):
 
 def leer_hoja_con_tlf(ruta_excel, nombre_hoja, fila_cabecera):
     """
-    Lee una hoja tratando la columna combinada TLF correctamente.
-    Las celdas combinadas en Excel dejan valor solo en la primera;
-    openpyxl las expande correctamente con data_only=True.
-    Devuelve un DataFrame con columnas TLF1 y TLF2 separadas.
+    Lee una hoja del Excel desde la fila de cabecera indicada.
+    - Los datos empiezan en columna B (columna A ignorada).
+    - Las cabeceras se limpian de caracteres invisibles.
+    - Las columnas sin nombre se descartan.
+    - Guarda el número de fila real del Excel en columna __fila_excel__
+      para que el log muestre siempre el número correcto.
     """
+    CHARS_INV = ['\u200e','\u200f','\u200b','\u200c','\u200d',
+                 '\u00ad','\ufeff','\u202a','\u202b','\u202c']
+
     wb = openpyxl.load_workbook(ruta_excel, data_only=True)
     ws = wb[nombre_hoja]
 
-    # Leer todas las filas desde la fila de cabecera
-    filas = list(ws.iter_rows(min_row=fila_cabecera, values_only=True))
-    if not filas:
+    # Leer cabecera desde columna B
+    cabecera_raw = [c.value for c in ws[fila_cabecera][1:]]  # [1:] = desde col B
+
+    # Limpiar nombres de cabecera
+    cabecera_limpia = []
+    for col in cabecera_raw:
+        if col is None:
+            cabecera_limpia.append(None)
+        else:
+            nombre = str(col).strip()
+            for char in CHARS_INV:
+                nombre = nombre.replace(char, "")
+            cabecera_limpia.append(nombre.strip() if nombre.strip() else None)
+
+    # Leer filas de datos guardando el número de fila real del Excel
+    registros = []
+    for fila_excel_num, row in enumerate(
+        ws.iter_rows(min_row=fila_cabecera + 1, min_col=2, values_only=True),
+        start=fila_cabecera + 1
+    ):
+        valores = list(row)
+        # Saltar filas completamente vacías
+        if all(v is None for v in valores):
+            continue
+        registro = dict(zip(cabecera_limpia, valores))
+        registro["__fila_excel__"] = fila_excel_num  # número real en el Excel
+        registros.append(registro)
+
+    if not registros:
+        wb.close()
         return pd.DataFrame()
 
-    cabecera_raw = list(filas[0])
-    datos = filas[1:]
+    df = pd.DataFrame(registros)
 
-    # Detectar columnas TLF (pueden estar combinadas: dos columnas con cabecera "TLF" o similar)
-    indices_tlf = []
-    cabecera_limpia = []
-    tlf_contador = 0
+    # Eliminar columnas sin nombre (None)
+    df = df.loc[:, df.columns.notna()]
 
-    for i, col in enumerate(cabecera_raw):
-        col_str = str(col).strip().upper() if col else ""
-        if col_str in ("TLF", "TELÉFONO", "TELEFONO", "TEL"):
-            tlf_contador += 1
-            cabecera_limpia.append(f"TLF{tlf_contador}")
-            indices_tlf.append(i)
-        elif col_str == "NONE" or col_str == "" or col is None:
-            # Columna sin cabecera justo después de TLF = segunda parte de columna combinada
-            if indices_tlf and i == indices_tlf[-1] + 1 and tlf_contador == 1:
-                tlf_contador += 1
-                cabecera_limpia.append(f"TLF{tlf_contador}")
-                indices_tlf.append(i)
-            else:
-                cabecera_limpia.append(f"__COL_{i}__")
-        else:
-            cabecera_limpia.append(str(col).strip())
-
-    # Construir DataFrame
-    df = pd.DataFrame(datos, columns=cabecera_limpia)
-
-    # Eliminar columnas auxiliares sin nombre real
-    cols_a_eliminar = [c for c in df.columns if c.startswith("__COL_")]
-    df = df.drop(columns=cols_a_eliminar, errors='ignore')
-
-    # Eliminar filas completamente vacías
-    df = df.dropna(how='all')
+    # Resetear índice secuencial (el número de fila real está en __fila_excel__)
+    df = df.reset_index(drop=True)
 
     wb.close()
     return df
@@ -280,7 +328,8 @@ def procesar_excel():
 
         # Añadir columnas faltantes como vacías
         for col in ["nombre","apellido1","apellido2","empresa","tipo","area","cargo",
-                    "email","TLF1","TLF2","año_ultimo_trabajo","nota","direccion","web",
+                    "MAIL1","MAIL2","MAIL3","TLF1","TLF2","TLF3",
+                    "año_ultimo_trabajo","nota","direccion","web",
                     "accion1","accion2","accion3","accion4","accion5","accion6","pais"]:
             if col not in df.columns:
                 df[col] = ""
@@ -299,16 +348,22 @@ def procesar_excel():
         avisos_hoja  = 0
 
         for idx, fila in df.iterrows():
-            fila_num = idx + fila_cabecera + 1  # Número de fila real en Excel
+            # Número de fila real en el Excel, guardado durante la lectura
+            fila_num = int(fila.get("__fila_excel__", idx + fila_cabecera + 1))
             avisos_fila = []
 
-            # Nombre — obligatorio
+            # Nombre — si está vacío, usar empresa silenciosamente sin aviso en log
             nombre_limpio = limpiar_nombre_propio(fila.get("nombre", ""))
+            empresa_limpia = limpiar_texto(fila.get("empresa", ""))
             if not nombre_limpio:
-                log_lineas.append(f"  ❌ FILA {fila_num}: Nombre vacío → contacto OMITIDO")
-                df.at[idx, "ACTIVO"] = "ERROR_NOMBRE"
-                errores_hoja += 1
-                continue
+                if empresa_limpia:
+                    nombre_limpio = empresa_limpia
+                    # Sin aviso en log: comportamiento esperado para contactos de empresa
+                else:
+                    log_lineas.append(f"  ❌ FILA {fila_num}: Nombre y empresa vacíos → contacto OMITIDO")
+                    df.at[idx, "ACTIVO"] = "ERROR_NOMBRE"
+                    errores_hoja += 1
+                    continue
             df.at[idx, "nombre"] = nombre_limpio
 
             # Apellidos
@@ -316,18 +371,21 @@ def procesar_excel():
             df.at[idx, "apellido2"] = limpiar_nombre_propio(fila.get("apellido2", ""))
 
             # Empresa y textos libres
-            for campo in ["empresa", "tipo", "area", "cargo", "nota", "direccion"]:
+            df.at[idx, "empresa"] = empresa_limpia
+            for campo in ["tipo", "area", "cargo", "nota", "direccion"]:
                 df.at[idx, campo] = limpiar_texto(fila.get(campo, ""))
 
-            # Email
-            email_limpio, email_valido, email_msg = limpiar_email(fila.get("email", ""))
-            df.at[idx, "email"] = email_limpio
-            if email_valido is False:
-                avisos_fila.append(f"Email inválido → se importa sin email")
-                df.at[idx, "email"] = ""
+            # Emails — hasta 3 campos (MAIL1, MAIL2, MAIL3)
+            for campo_mail in ["MAIL1", "MAIL2", "MAIL3"]:
+                email_limpio, email_valido, _ = limpiar_email(fila.get(campo_mail, ""))
+                if email_valido is False:
+                    avisos_fila.append(f"{campo_mail} inválido ('{fila.get(campo_mail,'')}') → se omite")
+                    df.at[idx, campo_mail] = ""
+                else:
+                    df.at[idx, campo_mail] = email_limpio
 
-            # Teléfonos
-            for campo_tlf in ["TLF1", "TLF2"]:
+            # Teléfonos — hasta 3 campos (TLF1, TLF2, TLF3)
+            for campo_tlf in ["TLF1", "TLF2", "TLF3"]:
                 tlf_limpio, tlf_valido, tlf_msg = limpiar_telefono(fila.get(campo_tlf, ""))
                 df.at[idx, campo_tlf] = tlf_limpio
                 if tlf_valido is False:
@@ -343,7 +401,7 @@ def procesar_excel():
             df.at[idx, "año_ultimo_trabajo"] = anio_limpio
             if anio_valido is False:
                 avisos_fila.append(f"Año inválido: '{fila.get('año_ultimo_trabajo','')}' → se omite")
-                df.at[idx, "año_ultimo_trabajo"] = ""
+                df.at[idx, "año_ultimo_trabajo"] = None
 
             # Acciones — texto libre, solo limpiar
             for ac in ["accion1","accion2","accion3","accion4","accion5","accion6"]:
@@ -360,16 +418,19 @@ def procesar_excel():
                 for av in avisos_fila:
                     log_lineas.append(f"      → {av}")
 
-            # Registrar email en índice global para detección de duplicados
-            if email_limpio:
-                if email_limpio not in emails_globales:
-                    emails_globales[email_limpio] = []
-                emails_globales[email_limpio].append({
-                    "hoja": nombre_interno,
-                    "fila": fila_num,
-                    "nombre": nombre_limpio,
-                    "idx": idx
-                })
+            # Registrar emails en índice global para detección de duplicados
+            for campo_mail in ["MAIL1", "MAIL2", "MAIL3"]:
+                em = str(df.at[idx, campo_mail]).strip().lower()
+                if em and em != "nan":
+                    if em not in emails_globales:
+                        emails_globales[em] = []
+                    emails_globales[em].append({
+                        "hoja": nombre_interno,
+                        "fila": fila_num,
+                        "nombre": nombre_limpio,
+                        "campo": campo_mail,
+                        "idx": idx
+                    })
 
         log_lineas.append(f"  ✅ Procesada: {len(df)} filas | ❌ Errores: {errores_hoja} | ⚠️  Avisos: {avisos_hoja}\n")
         hojas_procesadas[nombre_interno] = df
@@ -404,10 +465,25 @@ def procesar_excel():
 
     os.makedirs(os.path.dirname(RUTA_EXCEL_LIMPIO), exist_ok=True) if os.path.dirname(RUTA_EXCEL_LIMPIO) else None
 
+    # Orden de columnas deseado en el Excel limpio
+    ORDEN_COLUMNAS = [
+        "nombre", "apellido1", "apellido2", "empresa", "tipo", "area", "cargo",
+        "MAIL1", "MAIL2", "MAIL3", "TLF1", "TLF2", "TLF3",
+        "año_ultimo_trabajo", "nota", "direccion", "web",
+        "accion1", "accion2", "accion3", "accion4", "accion5", "accion6",
+        "pais", "ACTIVO", "categoria"
+    ]
+
     with pd.ExcelWriter(RUTA_EXCEL_LIMPIO, engine="openpyxl") as writer:
         for nombre_hoja, df in hojas_procesadas.items():
             # Excluir filas con errores críticos
-            df_valido = df[~df["ACTIVO"].str.startswith("ERROR", na=False)]
+            df_valido = df[~df["ACTIVO"].str.startswith("ERROR", na=False)].copy()
+            # Eliminar columna interna de número de fila (no va al Excel de salida)
+            df_valido = df_valido.drop(columns=["__fila_excel__"], errors="ignore")
+            # Reordenar columnas: primero las del orden deseado que existan, luego el resto
+            cols_ordenadas = [c for c in ORDEN_COLUMNAS if c in df_valido.columns]
+            cols_resto = [c for c in df_valido.columns if c not in ORDEN_COLUMNAS]
+            df_valido = df_valido[cols_ordenadas + cols_resto]
             df_valido.to_excel(writer, sheet_name=nombre_hoja[:31], index=False)
             log_lineas.append(f"  ✅ {nombre_hoja}: {len(df_valido)} contactos guardados")
 
