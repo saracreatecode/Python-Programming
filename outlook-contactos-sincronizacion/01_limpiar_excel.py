@@ -29,9 +29,9 @@ from datetime import datetime
 # CONFIGURACIÓN — ajusta estas rutas
 # ─────────────────────────────────────────────
 
-RUTA_EXCEL_ORIGINAL = r"\\servidor\ruta\al\excel\original.xlsx"   # Ruta al Excel en el servidor
-RUTA_EXCEL_LIMPIO   = r"\\servidor\ruta\al\excel\limpio.xlsx"  # Dónde guardar el resultado
-RUTA_LOG            = r"\\servidor\ruta\al\log\limpieza_log.txt"  # Log de errores/avisos
+RUTA_EXCEL_ORIGINAL = r"\\SERVIDOR\Compartido\contactos.xlsx"
+RUTA_EXCEL_LIMPIO   = r"\\SERVIDOR\Compartido\contactos_limpio.xlsx"
+RUTA_LOG            = r"\\SERVIDOR\Compartido\logs\limpieza_log.txt"
 
 # Hojas a procesar (G se excluye intencionadamente)
 HOJAS = {
@@ -436,27 +436,74 @@ def procesar_excel():
         hojas_procesadas[nombre_interno] = df
 
     # ── Detección de duplicados entre hojas ────────────────────
+    # Lógica:
+    # - Mismo email + mismo nombre + misma categoría → duplicado real → avisar y fusionar
+    # - Mismo email + mismo nombre + categorías distintas → fusionar silenciosamente, sin aviso
+    # - Mismo email + nombre distinto → ignorar completamente, sin aviso
     log_lineas.append(f"{'='*60}")
-    log_lineas.append("DETECCIÓN DE DUPLICADOS POR EMAIL")
+    log_lineas.append("DETECCIÓN DE DUPLICADOS")
     log_lineas.append(f"{'='*60}")
 
-    duplicados_encontrados = 0
+    duplicados_reales = 0
+    filas_a_eliminar = {}  # {nombre_hoja: set de idx a eliminar}
+
     for email, apariciones in emails_globales.items():
-        if len(apariciones) > 1:
-            duplicados_encontrados += 1
-            hojas_implicadas = [a["hoja"] for a in apariciones]
-            categorias_combinadas = " | ".join(hojas_implicadas)
-            log_lineas.append(
-                f"  ℹ️  AVISO DUPLICADO: '{apariciones[0]['nombre']}' ({email})\n"
-                f"      Aparece en: {', '.join(hojas_implicadas)}\n"
-                f"      Acción: se mantiene en ambas hojas con categorías: {categorias_combinadas}\n"
-                f"      → Revisa si hay datos distintos entre copias y decide cuál es la correcta."
+        if len(apariciones) <= 1:
+            continue
+
+        # Agrupar por nombre normalizado
+        grupos_por_nombre = {}
+        for ap in apariciones:
+            clave_nombre = ap["nombre"].strip().lower()
+            if clave_nombre not in grupos_por_nombre:
+                grupos_por_nombre[clave_nombre] = []
+            grupos_por_nombre[clave_nombre].append(ap)
+
+        for nombre_norm, grupo in grupos_por_nombre.items():
+            if len(grupo) == 1:
+                continue  # Solo aparece una vez con este nombre → no hacer nada
+
+            categorias_grupo = [a["hoja"] for a in grupo]
+            categorias_unicas = list(dict.fromkeys(categorias_grupo))  # orden preservado
+            hay_categoria_repetida = len(categorias_grupo) != len(categorias_unicas)
+
+            nombre_display = grupo[0]["nombre"]
+            categorias_str = " | ".join(categorias_unicas)
+
+            if hay_categoria_repetida:
+                # Mismo email + mismo nombre + misma categoría → duplicado real
+                duplicados_reales += 1
+                cats_repetidas = [c for c in categorias_unicas if categorias_grupo.count(c) > 1]
+                log_lineas.append(
+                    f"  ❗ DUPLICADO: '{nombre_display}' ({email})\n"
+                    f"      Categoría repetida: {', '.join(cats_repetidas)}\n"
+                    f"      → Aparece más de una vez en la misma hoja. Revisa el Excel."
+                )
+
+            # En ambos casos fusionar: actualizar primera aparición con todas las categorías
+            primera = grupo[0]
+            if primera["hoja"] in hojas_procesadas:
+                hojas_procesadas[primera["hoja"]].at[primera["idx"], "categoria"] = categorias_str
+
+            # Marcar el resto para eliminar
+            for ap in grupo[1:]:
+                if ap["hoja"] not in filas_a_eliminar:
+                    filas_a_eliminar[ap["hoja"]] = set()
+                filas_a_eliminar[ap["hoja"]].add(ap["idx"])
+
+    # Aplicar eliminaciones
+    for nombre_hoja, indices in filas_a_eliminar.items():
+        if nombre_hoja in hojas_procesadas:
+            hojas_procesadas[nombre_hoja] = (
+                hojas_procesadas[nombre_hoja]
+                .drop(index=list(indices))
+                .reset_index(drop=True)
             )
 
-    if duplicados_encontrados == 0:
-        log_lineas.append("  ✅ No se encontraron duplicados entre hojas.\n")
+    if duplicados_reales == 0:
+        log_lineas.append("  ✅ No se encontraron duplicados reales.\n")
     else:
-        log_lineas.append(f"\n  Total duplicados detectados: {duplicados_encontrados}\n")
+        log_lineas.append(f"\n  ❗ Duplicados reales (misma categoría): {duplicados_reales}\n")
 
     # ── Guardar Excel limpio ────────────────────────────────────
     log_lineas.append(f"{'='*60}")
